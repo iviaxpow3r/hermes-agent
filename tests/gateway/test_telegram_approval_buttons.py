@@ -4,6 +4,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from subprocess import TimeoutExpired
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,6 +63,7 @@ def _make_adapter(extra=None):
 # ===========================================================================
 # send_exec_approval — inline keyboard buttons
 # ===========================================================================
+
 
 class TestTelegramExecApproval:
     """Test the send_exec_approval method sends InlineKeyboard buttons."""
@@ -141,9 +143,7 @@ class TestTelegramExecApproval:
         mock_msg.message_id = 42
         adapter._bot.send_message = AsyncMock(return_value=mock_msg)
 
-        await adapter.send_exec_approval(
-            chat_id="12345", command="ls", session_key="s"
-        )
+        await adapter.send_exec_approval(chat_id="12345", command="ls", session_key="s")
 
         kwargs = adapter._bot.send_message.call_args[1]
         assert (
@@ -172,6 +172,7 @@ class TestTelegramExecApproval:
 # _handle_callback_query — approval button clicks
 # ===========================================================================
 
+
 class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
 
@@ -195,10 +196,14 @@ class TestTelegramApprovalCallback:
         update.callback_query = query
         context = MagicMock()
 
-        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+        with patch(
+            "tools.approval.resolve_gateway_approval", return_value=1
+        ) as mock_resolve:
             await adapter._handle_callback_query(update, context)
 
-        mock_resolve.assert_called_once_with("agent:main:telegram:group:12345:99", "once")
+        mock_resolve.assert_called_once_with(
+            "agent:main:telegram:group:12345:99", "once"
+        )
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
 
@@ -223,7 +228,9 @@ class TestTelegramApprovalCallback:
         update.callback_query = query
         context = MagicMock()
 
-        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+        with patch(
+            "tools.approval.resolve_gateway_approval", return_value=1
+        ) as mock_resolve:
             await adapter._handle_callback_query(update, context)
 
         mock_resolve.assert_called_once_with("some-session", "deny")
@@ -274,7 +281,9 @@ class TestTelegramApprovalCallback:
         # Model picker callback should be handled (not crash)
         # We just verify it doesn't try to resolve an approval
         with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
-            with patch.object(adapter, "_handle_model_picker_callback", new_callable=AsyncMock):
+            with patch.object(
+                adapter, "_handle_model_picker_callback", new_callable=AsyncMock
+            ):
                 await adapter._handle_callback_query(update, context)
 
         mock_resolve.assert_not_called()
@@ -358,3 +367,90 @@ class TestTelegramApprovalCallback:
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
         assert (tmp_path / ".update_response").read_text() == "n"
+
+    @pytest.mark.asyncio
+    async def test_configured_callback_route_runs_script(self):
+        adapter = _make_adapter(
+            extra={
+                "callback_routes": [
+                    {
+                        "prefix": "bni_",
+                        "script": "~/.agent/scripts/bni-callback-handler.py",
+                        "name": "BNI",
+                        "timeout": 12,
+                    }
+                ]
+            }
+        )
+
+        query = AsyncMock()
+        query.data = "bni_followup"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.answer = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        completed = MagicMock(stdout="ok", stderr="")
+        with patch(
+            "os.path.expanduser",
+            return_value="/Users/test/.agent/scripts/bni-callback-handler.py",
+        ):
+            with patch(
+                "gateway.platforms.telegram._Path.home",
+                return_value=Path("/Users/test"),
+            ):
+                with patch(
+                    "gateway.platforms.telegram._Path.exists", return_value=True
+                ):
+                    with patch("subprocess.run", return_value=completed) as mock_run:
+                        await adapter._handle_callback_query(update, MagicMock())
+
+        mock_run.assert_called_once()
+        args, kwargs = mock_run.call_args
+        assert args[0] == [
+            "python3",
+            "/Users/test/.agent/scripts/bni-callback-handler.py",
+            "--callback",
+            "bni_followup",
+        ]
+        assert kwargs["timeout"] == 12
+        query.answer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_configured_callback_route_timeout_still_answers(self):
+        adapter = _make_adapter(
+            extra={
+                "callback_routes": [
+                    {
+                        "prefix": "rt_",
+                        "script": "~/.agent/scripts/transcript-callback-handler.py",
+                    }
+                ]
+            }
+        )
+
+        query = AsyncMock()
+        query.data = "rt_route"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.answer = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch(
+            "os.path.expanduser",
+            return_value="/Users/test/.agent/scripts/transcript-callback-handler.py",
+        ):
+            with patch("gateway.platforms.telegram._Path.exists", return_value=True):
+                with patch(
+                    "subprocess.run",
+                    side_effect=TimeoutExpired(cmd=["python3"], timeout=30),
+                ):
+                    await adapter._handle_callback_query(update, MagicMock())
+
+        query.answer.assert_called_once()
